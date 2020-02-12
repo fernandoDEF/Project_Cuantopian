@@ -1,1 +1,202 @@
-------------------------------------
+#importacion de librerias
+import quantopian.algorithm as algo
+import quantopian.optimize as opt
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.factors import SimpleMovingAverage
+
+from quantopian.pipeline.filters import QTradableStocksUS
+from quantopian.pipeline.experimental import risk_loading_pipeline
+
+from quantopian.pipeline.data.psychsignal import stocktwits
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.factors import Returns
+from quantopian.pipeline.data.builtin import USEquityPricing
+
+#Asignacion de parametros
+MAX_GROSS_LEVERAGE = 1.0
+TOTAL_POSITIONS = 600
+
+#Aquí definimos el tamaño máximo de posición que se puede mantener para 
+#cualquier stock determinado. Si tiene una idea diferente de cuáles 
+#deberían ser estos tamaños máximos, no dude en cambiarlos. Tenga en 
+#cuenta que el optimizador necesita algo de margen para funcionar. Es 
+#decir, si su máximo es demasiado pequeño, el optimizador puede estar 
+#demasiado limitado.
+
+MAX_SHORT_POSITION_SIZE = 2.0 / TOTAL_POSITIONS
+MAX_LONG_POSITION_SIZE = 2.0 / TOTAL_POSITIONS
+
+
+def initialize(context):
+
+    algo.attach_pipeline(make_pipeline(), 'long_short_equity_template')
+
+    algo.attach_pipeline(risk_loading_pipeline(), 'risk_factors')
+
+    algo.schedule_function(func=rebalance,
+                           date_rule=algo.date_rules.week_start(),
+                           time_rule=algo.time_rules.market_open(hours=0, minutes=30),
+                           half_days=True)
+
+    # Record our portfolio variables at the end of day
+    algo.schedule_function(func=record_vars,
+                           date_rule=algo.date_rules.every_day(),
+                           time_rule=algo.time_rules.market_close(),
+                           half_days=True)
+def make_pipeline():
+    #Ejemplo de variables
+    value = Fundamentals.ebit.latest/Fundamentals.enterprise_value.latest
+    quality = Fundamentals.roe.latest
+    sentiment_score = SimpleMovingAverage(
+        inputs=[stocktwits.bull_minus_bear],
+        window_length=3,)
+    
+    #Variables adicionales
+    peg_payback = Fundamentals.peg_payback.latest
+    quick_ratio = Fundamentals.quick_ratio.latest
+    accounts_payable = Fundamentals.accounts_payable.latest
+    current_capital_lease_obligation = Fundamentals.current_capital_lease_obligation.latest
+    
+    universe = QTradableStocksUS()
+    
+    #Eliminamos los valores atipicos de las distribuciones
+    value_winsorized = value.winsorize(min_percentile=0.05, max_percentile=0.95)
+    quality_winsorized = quality.winsorize(min_percentile=0.05, max_percentile=0.95)
+    sentiment_score_winsorized = sentiment_score.winsorize(min_percentile=0.05,max_percentile=0.95)
+    
+    peg_payback_winsorized = peg_payback.winsorize(min_percentile=0.05, max_percentile=0.95)
+    quick_ratio_winsorized = quick_ratio.winsorize(min_percentile=0.05, max_percentile=0.95)
+    accounts_payable_winsorized = accounts_payable.winsorize(min_percentile=0.05, max_percentile=0.95)
+    current_capital_lease_obligation_winsorized = current_capital_lease_obligation.winsorize(min_percentile=0.05, max_percentile=0.95)
+    
+
+    # Aqui hacemos la combinacion y asignamos pesos
+    combined_factor = (
+        value_winsorized.zscore()*0.1 + 
+        quality_winsorized.zscore()*0.1 + 
+        sentiment_score_winsorized.zscore()*0.2+
+        
+        peg_payback_winsorized.zscore()*0.1+
+        quick_ratio_winsorized.zscore()*0.1+
+        accounts_payable_winsorized.zscore()*0.2+
+        current_capital_lease_obligation_winsorized.zscore()*0.2
+    )
+    
+    #Vamos escoger en cuales vamos en largo y cuales vamos en corto
+    longs = combined_factor.top(TOTAL_POSITIONS//2, mask=universe)
+    shorts = combined_factor.bottom(TOTAL_POSITIONS//2, mask=universe)
+
+    #La producción final de nuestra cartera solo debe incluir las 300       
+    #existencias superiores / inferiores según el criterios
+    long_short_screen = (longs | shorts)
+
+    # crea pipeline
+    pipe = Pipeline(
+        columns={
+            'longs': longs,
+            'shorts': shorts,
+            'combined_factor': combined_factor
+        },
+        screen=long_short_screen
+    )
+    return pipe
+
+
+def before_trading_start(context, data):
+    """
+    Optional core function called automatically before the open of each market day.
+    Parameters
+    ----------
+    context : AlgorithmContext
+        See description above.
+    data : BarData
+        An object that provides methods to get price and volume data, check
+        whether a security exists, and check the last time a security traded.
+    """
+    # Call algo.pipeline_output para obtener la salida.
+    #Nota: este es un marco de datos donde el índice son los SID de 
+    # todos los valores que pasan por mi pantalla y las columnas son       
+    #los factores agregados al objeto de canalización anterior.
+    context.pipeline_data = algo.pipeline_output('long_short_equity_template')
+
+    # Este marco de datos contendrá todas nuestras cargas de riesgo
+    context.risk_loadings = algo.pipeline_output('risk_factors')
+
+
+def record_vars(context, data):
+    """
+    A function scheduled to run every day at market close in order to record
+    strategy information.
+    Parameters
+    ----------
+    context : AlgorithmContext
+        See description above.
+    data : BarData
+        See description above.
+    """
+    # Traza el número de posiciones a lo largo del tiempo.
+    algo.record(num_positions=len(context.portfolio.positions))
+
+
+    #Llamado al comienzo de cada mes para reequilibrar las listas           
+    #largas y cortas.
+def rebalance(context, data):
+    """
+    A function scheduled to run once every Monday at 10AM ET in order 
+    to rebalance the longs and shorts lists.
+    Parameters
+    ----------
+    context : AlgorithmContext
+        See description above.
+    data : BarData
+        See description above.
+    """
+    # Retrieve pipeline output
+    pipeline_data = context.pipeline_data
+
+    risk_loadings = context.risk_loadings
+
+    # Aquí definimos nuestro objetivo para la API de Optimize. Hemos       
+    #seleccionado MaximizeAlpha porque creemos que nuestra                 
+    #clasificación de combinados es proporcional a los rendimientos         
+    #esperados. Esta rutina #optimizará el retorno esperado de nuestro     
+    #algoritmo, yendo por mucho #tiempo con el mayor retorno esperado y     
+    #corto por el más bajo.
+    objective = opt.MaximizeAlpha(pipeline_data.combined_factor)
+
+    # Define the list of constraints
+    constraints = []
+    # Constrain our maximum gross leverage
+    constraints.append(opt.MaxGrossExposure(MAX_GROSS_LEVERAGE))
+
+    # Require our algorithm to remain dollar neutral
+    constraints.append(opt.DollarNeutral())
+
+    # Add the RiskModelExposure constraint to make use of the
+    # default risk model constraints
+    neutralize_risk_factors = opt.experimental.RiskModelExposure(
+        risk_model_loadings=risk_loadings,
+        version=0
+    )
+    constraints.append(neutralize_risk_factors)
+
+    # Con esta restricción, exigimos que ninguna posición pueda             
+    #compensar más de MAX_SHORT_POSITION_SIZE en el lado corto y no más     
+    #de MAX_LONG_POSITION_SIZE en el lado largo. Esto garantiza que no     
+    #concentremos demasiado nuestra cartera en un valor o en un pequeño     
+    #subconjunto de valores.
+    constraints.append(
+        opt.PositionConcentration.with_equal_bounds(
+            min=-MAX_SHORT_POSITION_SIZE,
+            max=MAX_LONG_POSITION_SIZE
+        ))
+
+    # Reúna todas las piezas que definimos anteriormente pasándolas a       
+    #la función algo.order_optimal_portfolio. Esto maneja toda nuestra     
+    #lógica de pedido, asignando pesos apropiados a los valores en         
+    #nuestro universo para maximizar nuestro alfa con respecto a las       
+    #restricciones dadas.
+    algo.order_optimal_portfolio(
+        objective=objective,
+        constraints=constraints
+    )
